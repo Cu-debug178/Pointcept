@@ -1,0 +1,63 @@
+# Large files
+*.run
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# Data directories
+data/
+dataset/
+datasets/
+
+# Output directories
+exp/
+work_dirs/
+output/
+results/
+
+# PyTorch checkpoints
+*.pth
+*.pt
+checkpoints/
+
+# Logs
+*.log
+*.txt
+*.out
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# System
+.DS_Store
+Thumbs.db
+
+# CUDA
+*.cu
+*.cuh
+
+# Build artifacts
+build/
+*.so
+*.o
+*.egg-info/
+lib.linux-x86_64*/
+temp.linux-x86_64*/
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Libraries
+libs/pointops/build/
+libs/pointgroup_ops/build/
+pointcept/models/kpconvx/cpp_wrappers/*/build/
