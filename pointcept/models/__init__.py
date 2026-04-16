@@ -28,3 +28,4 @@ from .concerto import *
 # KPConvX
 from .kpconvx import *
 from .kpnext import *
+from .kpconvx_hybrid import *

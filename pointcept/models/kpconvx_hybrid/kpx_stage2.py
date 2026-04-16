@@ -13,21 +13,24 @@ class KPConvXStage2(KPConvXStage1):
     """
     Stage-2 improved KPConvX backbone.
 
-    Stage-2 = Stage-1 + dynamic local adapter (DA-KPConvX)
+    Stage-2 = Stage-1 + explicit Fine / Coarse dual-scale local adapter.
 
-    Pipeline:
-        stem
-        -> encoder stage
-        -> DA local adapter (selected stages)
-        -> SGCA-lite (selected stages)
-        -> pooling
-        -> decoder
-        -> head
+    Pipeline
+    --------
+    stem
+    -> encoder stage
+    -> dual-scale local adapter (selected stages)
+    -> SGCA-lite (selected stages)
+    -> pooling
+    -> decoder
+    -> head
 
-    Notes:
-        - keep KPConvX local blocks unchanged
-        - use existing neighbors from build_full_pyramid()
-        - do not rebuild dynamic graph
+    Notes
+    -----
+    - keep KPConvX local blocks unchanged
+    - reuse existing neighbors from build_full_pyramid()
+    - no dynamic graph rebuild
+    - memory-aware implementation for 24 GB GPU training
     """
 
     def __init__(
@@ -38,8 +41,11 @@ class KPConvXStage2(KPConvXStage1):
         enable_da=True,
         da_stages=(2, 3, 4),
         da_dropout=0.0,
-        da_scale_range=(0.75, 1.35),
-        da_branch_scales=(0.85, 1.25),
+        da_hidden_ratio=0.75,
+        da_scale_range=(0.80, 1.25),
+        da_fine_scale=0.85,
+        da_coarse_scale=1.20,
+        da_use_density=True,
         init_channels=64,
         channel_scaling=math.sqrt(2),
         **kwargs
@@ -79,9 +85,12 @@ class KPConvXStage2(KPConvXStage1):
                 f"da_{stage}",
                 DAKPXBlockAdapter(
                     dim=dim,
+                    hidden_ratio=da_hidden_ratio,
                     dropout=da_dropout,
                     scale_range=da_scale_range,
-                    branch_scales=da_branch_scales,
+                    fine_scale=da_fine_scale,
+                    coarse_scale=da_coarse_scale,
+                    use_density=da_use_density,
                 ),
             )
 
@@ -152,7 +161,7 @@ class KPConvXStage2(KPConvXStage1):
                         upcut=upcut,
                     )
 
-            # Stage-2 dynamic local adapter
+            # Fine / Coarse dual-scale local adapter
             feats = self._apply_da_if_needed(
                 stage_idx=layer,
                 feats=feats,
@@ -160,7 +169,7 @@ class KPConvXStage2(KPConvXStage1):
                 neighbors=in_dict.neighbors[l],
             )
 
-            # Stage-1 global context still stays here
+            # Global context branch from Stage-1
             feats = self._apply_sgca_if_needed(
                 stage_idx=layer,
                 feats=feats,

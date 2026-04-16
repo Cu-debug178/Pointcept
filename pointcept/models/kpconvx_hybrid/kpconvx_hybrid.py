@@ -1,128 +1,220 @@
 """
-KPConvXHybrid: minimal runnable hybrid model for S3DIS in Pointcept.
+Unified hybrid KPConvX backbone.
 
-Stage-0 target:
-    - Keep the model directly runnable in Pointcept.
-    - Reuse KPConvXBase as the actual working backbone.
-    - Reserve interfaces for future modules:
-        1) Geometry Difficulty Router
-        2) Sparse Global Context Branch
-        3) Feature Fusion
-        4) Boundary-aware Refinement Head
+Current composition:
+    KPConvXBase main body
+    + Stage-1 SGCA global context
+    + Stage-2 DA fine/coarse local adapter
+    + decoder refine module
 
-Planned full pipeline:
-    Input
-    -> KPConvX stem
-    -> Encoder stage 1
-    -> Encoder stage 2
-    -> Geometry Difficulty Router
-    -> Sparse Global Context Branch
-    -> Feature Fusion
-    -> Encoder stage 3
-    -> Encoder stage 4
-    -> Decoder
-    -> Boundary-aware Refinement Head
-    -> Point-wise Segmentation
-
-Current stage:
-    This file only provides a minimal wrapper over KPConvXBase.
-    Hybrid modules are not activated yet.
+This file intentionally provides one stable registry entry:
+    type="KPConvXHybrid"
 """
 
+import math
+import torch
+
 from pointcept.models.builder import MODELS
-from pointcept.models.kpconvx.kpconvx_base import KPConvXBase
+from pointcept.models.kpconvx.utils.torch_pyramid import build_full_pyramid
+
+from .kpx_stage2 import KPConvXStage2
+from .decoder_refine import DecoderRefineModule
 
 
 @MODELS.register_module("KPConvXHybrid")
-class KPConvXHybrid(KPConvXBase):
-    """
-    Minimal runnable hybrid wrapper.
-
-    Notes
-    -----
-    Stage-0 behavior:
-        output = KPConvXBase(input)
-
-    Future hybrid idea:
-        Let F_2 denote the feature after encoder stage 2.
-        A difficulty router will estimate:
-            s_i = Router(F_2, geometry_i)
-        where s_i is the difficulty score for region/point i.
-
-        Then a sparse global branch will process hard regions:
-            G = GlobalContext(F_2, s)
-
-        Fusion will combine local and global features:
-            F_2^fused = Fusion(F_2, G)
-
-        Finally decoder and refinement head will predict segmentation logits.
-    """
-
+class KPConvXHybrid(KPConvXStage2):
     def __init__(
         self,
-        in_channels=6,
+        in_channels=None,
+        input_channels=None,
         num_classes=13,
-        enable_router=False,
-        enable_global=False,
-        enable_refine=False,
-        router_cfg=None,
-        global_cfg=None,
-        fusion_cfg=None,
-        refine_cfg=None,
-        **kwargs
+        enable_refine=True,
+        refine_dropout=0.0,
+        refine_hidden_ratio=1.0,
+        refine_use_coord=True,
+        init_channels=64,
+        channel_scaling=math.sqrt(2),
+        **kwargs,
     ):
-        # Save future switches for later development.
-        self.enable_router = enable_router
-        self.enable_global = enable_global
+        if input_channels is None:
+            input_channels = in_channels
+        if input_channels is None:
+            raise ValueError("Either `in_channels` or `input_channels` must be provided.")
+
         self.enable_refine = enable_refine
+        self.refine_dropout = refine_dropout
+        self.refine_hidden_ratio = refine_hidden_ratio
+        self.refine_use_coord = refine_use_coord
+        self._hybrid_init_channels = init_channels
+        self._hybrid_channel_scaling = channel_scaling
 
-        self.router_cfg = router_cfg or {}
-        self.global_cfg = global_cfg or {}
-        self.fusion_cfg = fusion_cfg or {}
-        self.refine_cfg = refine_cfg or {}
-
-        # IMPORTANT:
-        # KPConvXBase expects `input_channels`, not `in_channels`.
         super().__init__(
-            input_channels=in_channels,
+            input_channels=input_channels,
             num_classes=num_classes,
-            **kwargs
+            init_channels=init_channels,
+            channel_scaling=channel_scaling,
+            **kwargs,
         )
 
+        if self.task != "cloud_segmentation":
+            self.enable_refine = False
+
+        if self.enable_refine:
+            finest_dim = self._compute_layer_channels(
+                init_channels=self._hybrid_init_channels,
+                channel_scaling=self._hybrid_channel_scaling,
+                num_layers=self.num_layers,
+            )[0]
+            hidden_dim = max(finest_dim, int(round(finest_dim * self.refine_hidden_ratio)))
+            self.decoder_refine = DecoderRefineModule(
+                dim=finest_dim,
+                hidden_dim=hidden_dim,
+                dropout=refine_dropout,
+                use_coord=refine_use_coord,
+            )
+        else:
+            self.decoder_refine = None
+
+    def _apply_refine_if_needed(self, feats, points, neighbors):
+        if not self.enable_refine or self.decoder_refine is None:
+            return feats
+        return self.decoder_refine(feats, points, neighbors)
+
     def forward(self, data_dict):
-        """
-        Stage-0 forward.
+        points = data_dict["coord"]
+        feats = data_dict["feat"]
+        offset = data_dict["offset"].int()
 
-        Current implementation:
-            logits = KPConvXBase(data_dict)
+        offset = torch.cat(
+            [torch.zeros(1, dtype=offset.dtype, device=offset.device), offset],
+            dim=0,
+        )
+        lengths = offset[1:] - offset[:-1]
 
-        Future implementation sketch:
-            1) Extract stage-2 features F_2
-            2) Compute difficulty score:
-                   s = Router(F_2, geometry)
-            3) Select or weight hard regions
-            4) Compute sparse global context:
-                   G = GlobalContext(F_2, s)
-            5) Fuse features:
-                   F_2^fused = Fusion(F_2, G)
-            6) Continue encoder / decoder / refinement
-            7) Output segmentation logits
-        """
-        return super().forward(data_dict)
+        in_dict = build_full_pyramid(
+            points,
+            lengths,
+            self.num_layers,
+            self.subsample_size,
+            self.first_radius,
+            self.radius_scaling,
+            self.neighbor_limits,
+            self.upsample_n,
+            sub_mode=self.in_sub_mode,
+            grid_pool_mode=self.grid_pool,
+        )
 
+        feats = self.stem(
+            in_dict.points[0],
+            in_dict.points[0],
+            feats,
+            in_dict.neighbors[0],
+        )
 
-from pointcept.models.builder import MODELS
-from .kpx_stage1 import KPConvXStage1
+        skip_feats = []
+        for layer in range(1, self.num_layers + 1):
+            l = layer - 1
+            block_list = getattr(self, f"encoder_{layer}")
 
+            if self.kp_mode in ["kpconv", "kpconvtest"]:
+                for block in block_list:
+                    feats = block(
+                        in_dict.points[l],
+                        in_dict.points[l],
+                        feats,
+                        in_dict.neighbors[l],
+                    )
+            else:
+                upcut = None
+                for block in block_list:
+                    feats, upcut = block(
+                        in_dict.points[l],
+                        in_dict.points[l],
+                        feats,
+                        in_dict.neighbors[l],
+                        in_dict.lengths[l],
+                        upcut=upcut,
+                    )
 
-@MODELS.register_module("KPConvXHybrid")
-class KPConvXHybrid(KPConvXStage1):
-    """
-    Backward-compatible alias.
+            feats = self._apply_da_if_needed(
+                stage_idx=layer,
+                feats=feats,
+                points=in_dict.points[l],
+                neighbors=in_dict.neighbors[l],
+            )
 
-    Old experiments that still use:
-        type="KPConvXHybrid"
+            feats = self._apply_sgca_if_needed(
+                stage_idx=layer,
+                feats=feats,
+                points=in_dict.points[l],
+                lengths=in_dict.lengths[l],
+            )
 
-    will automatically use the Stage-1 implementation.
-    """
-    pass
+            if layer < self.num_layers:
+                skip_feats.append(feats)
+
+                layer_pool = getattr(self, f"pooling_{layer}")
+                if self.grid_pool:
+                    if isinstance(in_dict.pools[l], tuple):
+                        feats = layer_pool(
+                            feats,
+                            in_dict.pools[l][0],
+                            idx_ptr=in_dict.pools[l][1],
+                        )
+                    else:
+                        feats = layer_pool(feats, in_dict.pools[l])
+                else:
+                    feats = layer_pool(
+                        in_dict.points[l + 1],
+                        in_dict.points[l],
+                        feats,
+                        in_dict.pools[l],
+                    )
+
+        if self.task == "classification":
+            feats = self.global_pooling(feats, in_dict.lengths[-1])
+        elif self.task == "cloud_segmentation":
+            for layer in range(self.num_layers - 1, 0, -1):
+                l = layer - 1
+                upsample = getattr(self, f"upsampling_{layer}")
+
+                if self.grid_pool:
+                    feats = upsample(feats, in_dict.upsamples[l])
+                else:
+                    feats = upsample(
+                        feats,
+                        in_dict.upsamples[l],
+                        in_dict.up_distances[l],
+                    )
+
+                feats = torch.cat([feats, skip_feats[l]], dim=1)
+
+                unary = getattr(self, f"decoder_unary_{layer}")
+                feats = unary(feats)
+
+                if self.add_decoder_layer:
+                    block = getattr(self, f"decoder_layer_{layer}")
+                    if self.kp_mode in ["kpconv", "kpconvtest"]:
+                        feats = block(
+                            in_dict.points[l],
+                            in_dict.points[l],
+                            feats,
+                            in_dict.neighbors[l],
+                        )
+                    else:
+                        feats, _ = block(
+                            in_dict.points[l],
+                            in_dict.points[l],
+                            feats,
+                            in_dict.neighbors[l],
+                            in_dict.lengths[l],
+                        )
+
+            feats = self._apply_refine_if_needed(
+                feats=feats,
+                points=in_dict.points[0],
+                neighbors=in_dict.neighbors[0],
+            )
+
+        logits = self.head(feats)
+        return logits
