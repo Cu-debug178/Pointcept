@@ -79,7 +79,12 @@ class KPConvXStage2(KPConvXStage1):
             if stage < 1 or stage > self.num_layers:
                 raise ValueError(f"Invalid DA stage index: {stage}")
 
-            dim = layer_channels[stage - 1]
+            # When grid_pool is enabled, the last block of each stage outputs
+            # the next layer's channels. So DA block should use the next layer's dim.
+            if self.grid_pool and stage < self.num_layers:
+                dim = layer_channels[stage]
+            else:
+                dim = layer_channels[stage - 1]
             setattr(
                 self,
                 f"da_{stage}",

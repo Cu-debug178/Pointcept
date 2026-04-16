@@ -2,14 +2,23 @@ import torch
 import torch.nn as nn
 
 
-class DecoderRefineModule(nn.Module):
+class DecoderRefineHead(nn.Module):
     """
-    Lightweight refine module placed after decoder and before segmentation head.
+    Lightweight decoder-side refinement head.
 
-    Design:
-        - keep the channel size unchanged
-        - reuse finest-level neighbors already built by KPConvX pyramid
-        - enhance boundary/detail recovery with local residual refinement
+    Design principles:
+        1. Reuse finest-level KPConvX neighbors.
+        2. Do not rebuild graph / topology.
+        3. Keep memory cost low for single 24G GPU training.
+        4. Refine final decoder features before segmentation head.
+
+    Input:
+        feats     : [N, C]
+        points    : [N, 3]
+        neighbors : [N, K]
+
+    Output:
+        refined feats : [N, C]
     """
 
     def __init__(
@@ -17,32 +26,56 @@ class DecoderRefineModule(nn.Module):
         dim,
         hidden_dim=None,
         dropout=0.0,
-        use_coord=True,
+        use_coords=True,
+        use_boundary=True,
     ):
         super().__init__()
         hidden_dim = hidden_dim or dim
-        self.use_coord = use_coord
+
+        self.dim = dim
+        self.use_coords = use_coords
+        self.use_boundary = use_boundary
 
         self.norm = nn.LayerNorm(dim)
-        self.coord_proj = nn.Sequential(
-            nn.Linear(3, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        ) if use_coord else None
 
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(dim * 2 + 1, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+        self.coord_proj = (
+            nn.Sequential(
+                nn.Linear(3, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, dim),
+            )
+            if use_coords
+            else None
         )
 
-        self.refine_mlp = nn.Sequential(
-            nn.Linear(dim * 3 + (3 if use_coord else 0), hidden_dim),
+        self.boundary_mlp = (
+            nn.Sequential(
+                nn.Linear(2, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+                nn.Sigmoid(),
+            )
+            if use_boundary
+            else None
+        )
+
+        mix_in_dim = dim * 2 + 1 + (dim if use_coords else 0)
+        gate_in_dim = dim * 2 + 1
+
+        self.mix = nn.Sequential(
+            nn.Linear(mix_in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, dim),
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(gate_in_dim, hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Sigmoid(),
         )
 
         self.out_proj = nn.Sequential(
@@ -56,38 +89,48 @@ class DecoderRefineModule(nn.Module):
         safe_neighbors = neighbors.clamp(min=0, max=max(num_points - 1, 0))
         return safe_neighbors, valid.float()
 
+    @staticmethod
+    def _masked_mean(values, valid_mask):
+        weight = valid_mask.unsqueeze(-1)
+        denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return (values * weight).sum(dim=1) / denom
+
+    @staticmethod
+    def _normalize_points(points):
+        if points.numel() == 0:
+            return points
+        centered = points - points.mean(dim=0, keepdim=True)
+        scale = centered.abs().amax(dim=0, keepdim=True).clamp(min=1e-6)
+        return centered / scale
+
     def forward(self, feats, points, neighbors):
         if feats.numel() == 0:
             return feats
 
         x = self.norm(feats)
-        safe_neighbors, valid = self._sanitize_neighbors(neighbors, x.shape[0])
+        safe_neighbors, valid = self._sanitize_neighbors(neighbors, feats.shape[0])
 
-        neigh_feats = x[safe_neighbors]                              # [N, K, C]
-        center_feats = x.unsqueeze(1).expand_as(neigh_feats)         # [N, K, C]
+        neigh_feats = x[safe_neighbors]
+        neigh_points = points[safe_neighbors]
 
-        neigh_points = points[safe_neighbors]                        # [N, K, 3]
-        center_points = points.unsqueeze(1)                          # [N, 1, 3]
-        rel_points = neigh_points - center_points                    # [N, K, 3]
-        dist = torch.norm(rel_points, dim=-1, keepdim=True)          # [N, K, 1]
+        mean_feat = self._masked_mean(neigh_feats, valid)
+        mean_point = self._masked_mean(neigh_points, valid)
 
-        edge_logits = self.edge_mlp(
-            torch.cat([center_feats, neigh_feats, dist], dim=-1)
-        ).squeeze(-1)
-        edge_logits = edge_logits.masked_fill(valid <= 0, float("-inf"))
-        edge_weight = torch.softmax(edge_logits, dim=1)
-        edge_weight = edge_weight * valid
-        edge_norm = edge_weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        edge_weight = edge_weight / edge_norm
+        feat_diff = torch.norm(x - mean_feat, dim=-1, keepdim=True)
+        coord_diff = torch.norm(points - mean_point, dim=-1, keepdim=True)
 
-        context = (edge_weight.unsqueeze(-1) * neigh_feats).sum(dim=1)
-        detail = x - context
+        if self.boundary_mlp is not None:
+            boundary_score = self.boundary_mlp(torch.cat([feat_diff, coord_diff], dim=-1))
+        else:
+            boundary_score = feat_diff.new_ones((feat_diff.shape[0], 1))
 
-        refine_inputs = [x, context, detail]
-        if self.use_coord:
-            coord_embed = self.coord_proj(rel_points.mean(dim=1))
-            refine_inputs.append(coord_embed)
+        mix_inputs = [x, mean_feat, boundary_score]
+        if self.coord_proj is not None:
+            coord_embed = self.coord_proj(self._normalize_points(points))
+            mix_inputs.append(coord_embed)
 
-        refined = self.refine_mlp(torch.cat(refine_inputs, dim=-1))
-        refined = self.out_proj(refined)
+        refined = self.mix(torch.cat(mix_inputs, dim=-1))
+        gate = self.gate(torch.cat([x, mean_feat, boundary_score], dim=-1))
+        refined = self.out_proj(gate * refined)
+
         return feats + refined

@@ -70,7 +70,11 @@ class KPConvXStage1(KPConvXBase):
             if stage < 1 or stage > self.num_layers:
                 raise ValueError(f"Invalid global stage index: {stage}")
 
-            dim = layer_channels[stage - 1]
+            # When grid_pool is enabled, use the next layer's channels
+            if self.grid_pool and stage < self.num_layers:
+                dim = layer_channels[stage]
+            else:
+                dim = layer_channels[stage - 1]
             patch_size = global_patch_sizes[min(i, len(global_patch_sizes) - 1)]
             num_heads = self._safe_num_heads(
                 dim=dim,

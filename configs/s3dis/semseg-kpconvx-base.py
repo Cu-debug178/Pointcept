@@ -15,6 +15,11 @@ max_input_pts = 40000
 # sync_bn = True
 # max_input_pts = 80000
 
+#其他需要覆盖的参数，我不使用wandb，wandb默认为False
+resume = False
+evaluate = False
+amp_dtype = "bfloat16"  # 启用bfloat16精度
+
 
 # model settings
 model = dict(
@@ -77,7 +82,7 @@ scheduler = dict(type="OneCycleLR",
 
 # dataset settings - S3DIS
 dataset_type = "S3DISDataset"
-data_root = "/root/autodl-tmp/data/S3DIS"
+data_root = "/root/autodl-tmp/data/s3ids"
 
 data = dict(
     num_classes=13,
