@@ -93,7 +93,7 @@ scheduler = dict(
 
 # dataset
 dataset_type = "S3DISDataset"
-data_root = "/root/autodl-tmp/data/S3DIS"
+data_root = "/root/autodl-tmp/data/s3dis"
 
 data = dict(
     num_classes=13,
@@ -144,7 +144,6 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
-                keys=("coord", "color", "normal", "segment"),
                 return_min_coord=True,
             ),
             dict(type="SphereCrop", point_max=max_input_pts, mode="random"),
@@ -171,7 +170,6 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
-                keys=("coord", "color", "normal", "segment"),
                 return_min_coord=True,
             ),
             dict(type="CenterShift", apply_z=False),
@@ -200,7 +198,6 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="test",
-                keys=("coord", "color", "normal"),
             ),
             crop=None,
             post_transform=[

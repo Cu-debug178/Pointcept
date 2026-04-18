@@ -46,10 +46,14 @@ class KPConvXStage2(KPConvXStage1):
         da_fine_scale=0.85,
         da_coarse_scale=1.20,
         da_use_density=True,
+        da_branch_scales=None,
         init_channels=64,
         channel_scaling=math.sqrt(2),
         **kwargs
     ):
+        if da_branch_scales is not None:
+            da_fine_scale = da_branch_scales[0]
+            da_coarse_scale = da_branch_scales[1]
         if input_channels is None:
             input_channels = in_channels
         if input_channels is None:

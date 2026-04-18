@@ -19,6 +19,7 @@ max_input_pts = 40000
 resume = False
 evaluate = False
 amp_dtype = "bfloat16"  # 启用bfloat16精度
+save_freq = 5
 
 
 # model settings
@@ -70,8 +71,10 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 1000
-eval_epoch = 200
+# epoch = 1000
+#先训练50轮看看效果
+epoch = 50
+eval_epoch = 50
 optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.02)
 scheduler = dict(type="OneCycleLR",
                  max_lr=optimizer["lr"],
@@ -82,7 +85,7 @@ scheduler = dict(type="OneCycleLR",
 
 # dataset settings - S3DIS
 dataset_type = "S3DISDataset"
-data_root = "/root/autodl-tmp/data/s3ids"
+data_root = "/root/autodl-tmp/data/s3dis"
 
 data = dict(
     num_classes=13,
@@ -111,7 +114,6 @@ data = dict(
                  grid_size=0.02, 
                  hash_type="fnv", 
                  mode="train", 
-                 keys=("coord", "color", "normal", "segment"),
                  return_min_coord=True),
             dict(type="SphereCrop", point_max=max_input_pts, mode="random"),
             dict(type="CenterShift", apply_z=False),
@@ -133,7 +135,6 @@ data = dict(
                  grid_size=0.02, 
                  hash_type="fnv", 
                  mode="train", 
-                 keys=("coord", "color", "normal", "segment"),
                  return_min_coord=True),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
@@ -156,8 +157,7 @@ data = dict(
             voxelize=dict(type="GridSample",
                           grid_size=0.02,
                           hash_type="fnv",
-                          mode="test",
-                          keys=("coord", "color", "normal")
+                          mode="test"
                           ),
             crop=None,
             post_transform=[
