@@ -2,10 +2,14 @@ _base_ = ["../_base_/default_runtime.py"]
 
 # runtime (single 4090D 24G friendly)
 num_worker = 8
-batch_size = 1
+batch_size = 1 #先试试2可以训练吗
 mix_prob = 0.8
-enable_amp = True
 max_input_pts = 30000
+
+#梯度裁剪
+clip_grad = 1.0
+enable_amp = False
+loop = 1
 
 # model
 model = dict(
@@ -43,6 +47,15 @@ model = dict(
         bn_momentum=0.1,
         smooth_labels=False,
         class_w=(),
+
+        # Router: 决策器
+        enable_router=True,
+        router_stages=(2, 3, 4),
+        router_hidden_ratio=0.5,
+        router_dropout=0.0,
+        router_temperature=1.0,
+        router_local_boost=1.0,
+        router_global_boost=1.0,
 
         # Stage-1 global context
         enable_global=True,
@@ -82,8 +95,8 @@ model = dict(
 )
 
 # scheduler
-epoch = 1000
-eval_epoch = 200
+epoch = 200
+eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.02)
 scheduler = dict(
     type="OneCycleLR",
@@ -96,7 +109,7 @@ scheduler = dict(
 
 # dataset
 dataset_type = "S3DISDataset"
-data_root = "/root/autodl-tmp/data/S3DIS"
+data_root = "/root/autodl-tmp/data/s3dis"
 
 data = dict(
     num_classes=13,
@@ -139,7 +152,6 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
-                keys=("coord", "color", "normal", "segment"),
                 return_min_coord=True,
             ),
             dict(type="SphereCrop", point_max=max_input_pts, mode="random"),
@@ -162,7 +174,6 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
-                keys=("coord", "color", "normal", "segment"),
                 return_min_coord=True,
             ),
             dict(type="CenterShift", apply_z=False),
@@ -187,7 +198,6 @@ data = dict(
                 grid_size=0.02,
                 hash_type="fnv",
                 mode="test",
-                keys=("coord", "color", "normal"),
             ),
             crop=None,
             post_transform=[

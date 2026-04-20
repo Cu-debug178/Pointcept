@@ -134,6 +134,7 @@ data = dict(
             dict(type="GridSample", 
                  grid_size=0.02, 
                  hash_type="fnv", 
+                 #mode的作用是确定是否是训练集还是验证集
                  mode="train", 
                  return_min_coord=True),
             dict(type="CenterShift", apply_z=False),

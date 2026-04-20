@@ -6,7 +6,7 @@ PYTHON=python
 
 TRAIN_CODE=train.py
 
-DATASET=scannet
+DATASET=s3dis
 CONFIG="None"
 EXP_NAME=debug
 WEIGHT="None"
@@ -69,7 +69,7 @@ fi
 
 echo "Dist URL: $DIST_URL"
 
-EXP_DIR=exp/${DATASET}/${EXP_NAME}
+EXP_DIR=exp/${DATASET}/${EXP_NAME}_$(date +%Y%m%d_%H%M)
 MODEL_DIR=${EXP_DIR}/model
 CODE_DIR=${EXP_DIR}/code
 CONFIG_DIR=configs/${DATASET}/${CONFIG}.py

@@ -45,7 +45,6 @@ class KPConvXStage2(KPConvXStage1):
         da_scale_range=(0.80, 1.25),
         da_fine_scale=0.85,
         da_coarse_scale=1.20,
-        da_use_density=True,
         da_branch_scales=None,
         init_channels=64,
         channel_scaling=math.sqrt(2),
@@ -94,12 +93,10 @@ class KPConvXStage2(KPConvXStage1):
                 f"da_{stage}",
                 DAKPXBlockAdapter(
                     dim=dim,
-                    hidden_ratio=da_hidden_ratio,
+                    hidden_dim=int(dim * da_hidden_ratio),
                     dropout=da_dropout,
                     scale_range=da_scale_range,
-                    fine_scale=da_fine_scale,
-                    coarse_scale=da_coarse_scale,
-                    use_density=da_use_density,
+                    branch_scales=(da_fine_scale, da_coarse_scale),
                 ),
             )
 

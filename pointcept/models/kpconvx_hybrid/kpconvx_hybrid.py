@@ -5,6 +5,7 @@ from pointcept.models.builder import MODELS
 from pointcept.models.kpconvx.utils.torch_pyramid import build_full_pyramid
 
 from .decoder_refine import DecoderRefineHead
+from .geometry_router import GeometryDifficultyRouter
 from .kpx_stage2 import KPConvXStage2
 
 
@@ -13,10 +14,12 @@ class KPConvXHybrid(KPConvXStage2):
     """
     Final hybrid backbone used in this project.
 
-    Current effective pipeline:
+    Effective pipeline:
         KPConvX base backbone
+        -> geometry difficulty router
         -> Stage-2 dynamic local adapter (DA)
         -> SGCA-lite global context
+        -> difficulty-aware global fusion
         -> decoder
         -> lightweight decoder refine
         -> segmentation head
@@ -24,7 +27,7 @@ class KPConvXHybrid(KPConvXStage2):
     Notes:
         - keep KPConvXBase as the true backbone主体
         - do not rebuild dynamic graph
-        - refine only acts on final decoder features
+        - router changes actual model behavior
         - preserve Pointcept DefaultSegmentor compatibility
     """
 
@@ -33,11 +36,17 @@ class KPConvXHybrid(KPConvXStage2):
         in_channels=None,
         input_channels=None,
         num_classes=13,
-        enable_router=False,
+        enable_router=True,
         router_cfg=None,
         global_cfg=None,
         fusion_cfg=None,
         refine_cfg=None,
+        router_stages=(2, 3, 4),
+        router_hidden_ratio=0.5,
+        router_dropout=0.0,
+        router_temperature=1.0,
+        router_local_boost=1.0,
+        router_global_boost=1.0,
         enable_global=True,
         global_stages=(4, 5),
         global_patch_sizes=(192, 320),
@@ -63,16 +72,26 @@ class KPConvXHybrid(KPConvXStage2):
         if input_channels is None:
             raise ValueError("Either `in_channels` or `input_channels` must be provided.")
 
-        self.enable_router = enable_router
         self.router_cfg = router_cfg or {}
         self.global_cfg = global_cfg or {}
         self.fusion_cfg = fusion_cfg or {}
         self.refine_cfg = refine_cfg or {}
 
+        enable_router = self.router_cfg.get("enable", enable_router)
+        router_stages = self.router_cfg.get("stages", router_stages)
+        router_hidden_ratio = self.router_cfg.get("hidden_ratio", router_hidden_ratio)
+        router_dropout = self.router_cfg.get("dropout", router_dropout)
+        router_temperature = self.router_cfg.get("temperature", router_temperature)
+        router_local_boost = self.router_cfg.get("local_boost", router_local_boost)
+        router_global_boost = self.router_cfg.get("global_boost", router_global_boost)
+
         refine_hidden_ratio = self.refine_cfg.get("hidden_ratio", refine_hidden_ratio)
         refine_dropout = self.refine_cfg.get("dropout", refine_dropout)
         refine_use_coords = self.refine_cfg.get("use_coords", refine_use_coords)
         refine_use_boundary = self.refine_cfg.get("use_boundary", refine_use_boundary)
+
+        self.enable_router = bool(enable_router)
+        self.router_stages = tuple(router_stages) if self.enable_router else tuple()
 
         self._hybrid_init_channels = init_channels
         self._hybrid_channel_scaling = channel_scaling
@@ -96,14 +115,38 @@ class KPConvXHybrid(KPConvXStage2):
             **kwargs,
         )
 
-        self.enable_refine = bool(enable_refine) and self.task == "cloud_segmentation"
+        layer_channels = self._compute_layer_channels(
+            init_channels=self._hybrid_init_channels,
+            channel_scaling=self._hybrid_channel_scaling,
+            num_layers=self.num_layers,
+        )
 
+        if self.enable_router:
+            for stage in self.router_stages:
+                if stage < 1 or stage > self.num_layers:
+                    raise ValueError(f"Invalid router stage index: {stage}")
+                # When grid_pool is enabled, the last block of each stage outputs
+                # the next layer's channels. So router should use the next layer's dim.
+                if self.grid_pool and stage < self.num_layers:
+                    dim = layer_channels[stage]
+                else:
+                    dim = layer_channels[stage - 1]
+                hidden_dim = max(32, int(dim * float(router_hidden_ratio)))
+                setattr(
+                    self,
+                    f"router_{stage}",
+                    GeometryDifficultyRouter(
+                        dim=dim,
+                        hidden_dim=hidden_dim,
+                        dropout=router_dropout,
+                        temperature=router_temperature,
+                        local_boost=router_local_boost,
+                        global_boost=router_global_boost,
+                    ),
+                )
+
+        self.enable_refine = bool(enable_refine) and self.task == "cloud_segmentation"
         if self.enable_refine:
-            layer_channels = self._compute_layer_channels(
-                init_channels=self._hybrid_init_channels,
-                channel_scaling=self._hybrid_channel_scaling,
-                num_layers=self.num_layers,
-            )
             refine_dim = layer_channels[0]
             refine_hidden_dim = max(32, int(refine_dim * float(refine_hidden_ratio)))
             self.decoder_refine = DecoderRefineHead(
@@ -113,6 +156,38 @@ class KPConvXHybrid(KPConvXStage2):
                 use_coords=refine_use_coords,
                 use_boundary=refine_use_boundary,
             )
+
+    def _route_stage_if_needed(self, stage_idx, feats, points, neighbors):
+        if not self.enable_router:
+            return None
+        if stage_idx not in self.router_stages:
+            return None
+        router = getattr(self, f"router_{stage_idx}")
+        return router(feats, points, neighbors)
+
+    def _apply_da_if_needed(self, stage_idx, feats, points, neighbors, router_state=None):
+        if not self.enable_da:
+            return feats
+        if stage_idx not in self.da_stages:
+            return feats
+        da_block = getattr(self, f"da_{stage_idx}")
+        route_logits = None if router_state is None else router_state.get("local_logits")
+        return da_block(feats, points, neighbors, route_logits=route_logits)
+
+    def _apply_global_with_router(self, stage_idx, feats, points, lengths, router_state=None):
+        out = self._apply_sgca_if_needed(
+            stage_idx=stage_idx,
+            feats=feats,
+            points=points,
+            lengths=lengths,
+        )
+        if router_state is None:
+            return out
+
+        global_weight = router_state.get("global_weight")
+        if global_weight is None:
+            return out
+        return feats + global_weight * (out - feats)
 
     def _apply_refine_if_needed(self, feats, points, neighbors):
         if not self.enable_refine:
@@ -178,18 +253,27 @@ class KPConvXHybrid(KPConvXStage2):
                         upcut=upcut,
                     )
 
-            feats = self._apply_da_if_needed(
+            router_state = self._route_stage_if_needed(
                 stage_idx=layer,
                 feats=feats,
                 points=in_dict.points[l],
                 neighbors=in_dict.neighbors[l],
             )
 
-            feats = self._apply_sgca_if_needed(
+            feats = self._apply_da_if_needed(
+                stage_idx=layer,
+                feats=feats,
+                points=in_dict.points[l],
+                neighbors=in_dict.neighbors[l],
+                router_state=router_state,
+            )
+
+            feats = self._apply_global_with_router(
                 stage_idx=layer,
                 feats=feats,
                 points=in_dict.points[l],
                 lengths=in_dict.lengths[l],
+                router_state=router_state,
             )
 
             if layer < self.num_layers:

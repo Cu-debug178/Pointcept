@@ -24,10 +24,12 @@ def lengths_to_batch_index(lengths: torch.Tensor) -> torch.Tensor:
 
 
 def batch_segment_mean(x: torch.Tensor, batch_ids: torch.Tensor, batch_size: int) -> torch.Tensor:
+    # Clamp batch_ids to valid range [0, batch_size) to prevent index out of bounds
+    batch_ids_clamped = torch.clamp(batch_ids, 0, batch_size - 1)
     out = x.new_zeros((batch_size, x.shape[-1]))
     cnt = x.new_zeros((batch_size, 1))
-    out.index_add_(0, batch_ids, x)
-    cnt.index_add_(0, batch_ids, torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype))
+    out.index_add_(0, batch_ids_clamped, x)
+    cnt.index_add_(0, batch_ids_clamped, torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype))
     out = out / cnt.clamp(min=1.0)
     return out
 
