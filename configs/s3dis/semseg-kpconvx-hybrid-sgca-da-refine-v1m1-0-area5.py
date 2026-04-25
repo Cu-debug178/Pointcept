@@ -2,7 +2,9 @@ _base_ = ["../_base_/default_runtime.py"]
 
 # runtime (single 4090D 24G friendly)
 num_worker = 8
-batch_size = 1 #先试试2可以训练吗
+batch_size = 3 #先试试2可以训练吗
+
+# batch_size_test = 8 设置8报错了
 mix_prob = 0.8
 max_input_pts = 30000
 
@@ -95,8 +97,8 @@ model = dict(
 )
 
 # scheduler
-epoch = 200
-eval_epoch = 100
+epoch = 1000
+eval_epoch = 200
 optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.02)
 scheduler = dict(
     type="OneCycleLR",
@@ -176,10 +178,12 @@ data = dict(
                 mode="train",
                 return_min_coord=True,
             ),
+            dict(type="SphereCrop", point_max=max_input_pts, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Collect", keys=("coord", "segment"), feat_keys=("coord", "color", "normal")),
+            dict(type="Collect", keys=("coord", "segment"), 
+            feat_keys=("coord", "color", "normal")),
         ],
         test_mode=False,
     ),

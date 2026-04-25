@@ -3,6 +3,7 @@ resume = False  # whether to resume training process (是否恢复训练进程)
 evaluate = True  # evaluate after each epoch training process (每个epoch训练后进行评估)
 test_only = False  # test process (仅测试模式)
 
+
 seed = None  # train process will init a random seed and record (训练过程将初始化随机种子并记录)
 save_path = "exp/default"  # save path for output files (输出文件保存路径)
 num_worker = 16  # total worker in all gpu (所有GPU的总工作线程数)

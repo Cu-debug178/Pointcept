@@ -1056,6 +1056,59 @@ class SphereCrop(object):
             data_dict = index_operator(data_dict, idx_crop)
         return data_dict
 
+#新加的大房间裁剪，用于测试时的全场景评估，解决爆显存问题
+@TRANSFORMS.register_module()
+class TestSphereCrop(object):
+    """
+    Split one large test fragment into several smaller fragments, so that
+    each point is still evaluated and merged back by its global ``index``.
+    This is a true full-scene test, not validation-time subsampling.
+    """
+
+    def __init__(self, point_max=80000):
+        self.point_max = point_max
+
+    @staticmethod
+    def _slice_data(data_dict, idx):
+        data_part = dict()
+        n = data_dict["coord"].shape[0]
+        index_keys = set(data_dict.get("index_valid_keys", []))
+        index_keys.update(["index", "grid_coord", "displacement"])
+
+        for key, value in data_dict.items():
+            if key in index_keys:
+                data_part[key] = value[idx]
+            elif isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == n:
+                data_part[key] = value[idx]
+            elif torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == n:
+                data_part[key] = value[idx]
+            elif key == "index_valid_keys":
+                data_part[key] = copy.copy(value)
+            else:
+                data_part[key] = copy.deepcopy(value)
+        return data_part
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict.keys()
+        n = data_dict["coord"].shape[0]
+        if n <= self.point_max:
+            return [data_dict]
+
+        coord = data_dict["coord"]
+        remain_mask = np.ones(n, dtype=bool)
+        parts = []
+
+        while np.any(remain_mask):
+            remain_idx = np.where(remain_mask)[0]
+            seed_idx = remain_idx[0]
+            center = coord[seed_idx]
+            dist2 = np.sum((coord[remain_idx] - center) ** 2, axis=1)
+            local_pick = np.argsort(dist2)[: self.point_max]
+            idx_crop = remain_idx[local_pick]
+            remain_mask[idx_crop] = False
+            parts.append(self._slice_data(data_dict, idx_crop))
+
+        return parts
 
 @TRANSFORMS.register_module()
 class ShufflePoint(object):

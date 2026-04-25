@@ -40,6 +40,11 @@ class bcolors:
 from pointcept.models.kpnext.ply import read_ply, write_ply
 
 
+def init_gpu():
+    """Initialize GPU device if available, otherwise use CPU."""
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 # ------------------------------------------------------------------------------------------
 #
 #           Functions

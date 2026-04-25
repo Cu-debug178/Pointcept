@@ -6,7 +6,7 @@ PYTHON=python
 
 TRAIN_CODE=train.py
 
-DATASET=scannet
+DATASET=s3dis
 CONFIG="None"
 EXP_NAME=debug
 WEIGHT="None"
@@ -69,8 +69,6 @@ fi
 
 echo "Dist URL: $DIST_URL"
 
-# EXP_DIR=exp/${DATASET}/${EXP_NAME}
-#加入日期，训练名字不会重复
 EXP_DIR=exp/${DATASET}/${EXP_NAME}_$(date +%Y%m%d_%H%M)
 MODEL_DIR=${EXP_DIR}/model
 CODE_DIR=${EXP_DIR}/code
@@ -104,7 +102,7 @@ then
     --num-machines "$NUM_MACHINE" \
     --machine-rank ${SLURM_NODEID:-0} \
     --dist-url ${DIST_URL} \
-    --options save_path="$EXP_DIR"
+    --options save_path="$EXP_DIR" || (echo "训练失败，立即关机"; shutdown -h now)
 else
     $PYTHON "$CODE_DIR"/tools/$TRAIN_CODE \
     --config-file "$CONFIG_DIR" \
@@ -112,5 +110,12 @@ else
     --num-machines "$NUM_MACHINE" \
     --machine-rank ${SLURM_NODEID:-0} \
     --dist-url ${DIST_URL} \
-    --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT"
+    --options save_path="$EXP_DIR" resume="$RESUME" weight="$WEIGHT" || (echo "训练失败，立即关机"; shutdown -h now)
 fi
+
+# 训练成功完成，5分钟后关机
+echo "训练成功完成，5分钟后自动关机..."
+echo "如果需要取消关机，请执行: shutdown -c"
+sleep 10
+shutdown -h now
+

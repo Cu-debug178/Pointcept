@@ -16,10 +16,7 @@ max_input_pts = 40000
 # max_input_pts = 80000
 
 #其他需要覆盖的参数，我不使用wandb，wandb默认为False
-resume = False
-evaluate = False
-amp_dtype = "bfloat16"  # 启用bfloat16精度
-save_freq = 5
+save_freq = 100
 
 
 # model settings
@@ -71,10 +68,9 @@ model = dict(
 )
 
 # scheduler settings
-# epoch = 1000
+epoch = 1000
+eval_epoch = 200
 #先训练50轮看看效果
-epoch = 50
-eval_epoch = 50
 optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.02)
 scheduler = dict(type="OneCycleLR",
                  max_lr=optimizer["lr"],
@@ -166,28 +162,40 @@ data = dict(
                 dict(type="ToTensor"),
                 dict(type="Collect", keys=("coord", "index"), feat_keys=("coord", "color", "normal"))
             ],
-            aug_transform=[
-                [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1)],
-                [dict(type="RandomRotateTargetAngle", angle=[1/2], axis="z", center=[0, 0, 0], p=1)],
-                [dict(type="RandomRotateTargetAngle", angle=[1], axis="z", center=[0, 0, 0], p=1)],
-                [dict(type="RandomRotateTargetAngle", angle=[3/2], axis="z", center=[0, 0, 0], p=1)],
-                [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[0.95, 0.95])],
-                [dict(type="RandomRotateTargetAngle", angle=[1 / 2], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[0.95, 0.95])],
-                [dict(type="RandomRotateTargetAngle", angle=[1], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[0.95, 0.95])],
-                [dict(type="RandomRotateTargetAngle", angle=[3 / 2], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[0.95, 0.95])],
-                [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[1.05, 1.05])],
-                [dict(type="RandomRotateTargetAngle", angle=[1 / 2], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[1.05, 1.05])],
-                [dict(type="RandomRotateTargetAngle", angle=[1], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[1.05, 1.05])],
-                [dict(type="RandomRotateTargetAngle", angle=[3 / 2], axis="z", center=[0, 0, 0], p=1),
-                 dict(type="RandomScale", scale=[1.05, 1.05])],
-                [dict(type="RandomFlip", p=1)]
+            # aug_transform=[
+            #     [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1)],
+            #     [dict(type="RandomRotateTargetAngle", angle=[1/2], axis="z", center=[0, 0, 0], p=1)],
+            #     [dict(type="RandomRotateTargetAngle", angle=[1], axis="z", center=[0, 0, 0], p=1)],
+            #     [dict(type="RandomRotateTargetAngle", angle=[3/2], axis="z", center=[0, 0, 0], p=1)],
+            #     [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[0.95, 0.95])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[1 / 2], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[0.95, 0.95])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[1], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[0.95, 0.95])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[3 / 2], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[0.95, 0.95])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[1.05, 1.05])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[1 / 2], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[1.05, 1.05])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[1], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[1.05, 1.05])],
+            #     [dict(type="RandomRotateTargetAngle", angle=[3 / 2], axis="z", center=[0, 0, 0], p=1),
+            #      dict(type="RandomScale", scale=[1.05, 1.05])],
+            #     [dict(type="RandomFlip", p=1)]
+            # ]
+            
+            #先是用4组变化，后最终在考虑使用13种变化
+            aug_transform = [
+                [dict(type="RandomRotateTargetAngle", angle=[0], 
+                axis="z", center=[0, 0, 0], p=1)],
+                [dict(type="RandomRotateTargetAngle", 
+                angle=[1/2], axis="z", center=[0, 0, 0], p=1)],
+                [dict(type="RandomRotateTargetAngle", 
+                angle=[1], axis="z", center=[0, 0, 0], p=1)],
+                [dict(type="RandomRotateTargetAngle", 
+                angle=[3/2], axis="z", center=[0, 0, 0], p=1)],
             ]
         )
     ),

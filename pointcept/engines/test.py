@@ -100,6 +100,21 @@ class TesterBase:
             test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
         else:
             test_sampler = None
+    
+        # test_loader = torch.utils.data.DataLoader(
+        #     test_dataset,
+        #     batch_size=self.cfg.batch_size_test_per_gpu,
+        #     shuffle=False,
+        #     # num_workers=self.cfg.num_worker_per_gpu,
+        #     num_workers=4,
+        #     pin_memory=True,
+        #     # persistent_workers=self.cfg.num_worker_per_gpu > 0,
+        #     persistent_workers=False,
+        #     prefetch_factor=2 if self.cfg.num_worker_per_gpu > 0 else None,
+        #     sampler=test_sampler,
+        #     collate_fn=self.__class__.collate_fn,
+        # )
+
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
             batch_size=self.cfg.batch_size_test_per_gpu,
@@ -183,36 +198,80 @@ class SemSegTester(TesterBase):
                 if "origin_segment" in data_dict.keys():
                     segment = data_dict["origin_segment"]
             else:
+                #每个 fragment 及时释放显存，打印点云数目
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
-                for i in range(len(fragment_list)):
-                    fragment_batch_size = 1
-                    s_i, e_i = i * fragment_batch_size, min(
-                        (i + 1) * fragment_batch_size, len(fragment_list)
-                    )
+                fragment_batch_size = getattr(self.cfg, "fragment_batch_size_test", 1)
+
+                for i in range(0, len(fragment_list), fragment_batch_size):
+                    s_i, e_i = i, min(i + fragment_batch_size, len(fragment_list))
                     input_dict = collate_fn(fragment_list[s_i:e_i])
+
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
                     idx_part = input_dict["index"]
-                    with torch.no_grad():
-                        pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
-                        pred_part = F.softmax(pred_part, -1)
+                    n_fragment_points = int(input_dict["coord"].shape[0])
+                    pred_part = None
+
+                    try:
+                        with torch.no_grad():
+                            pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                            pred_part = F.softmax(pred_part, -1)
+
+                            bs = 0
+                            for be in input_dict["offset"]:
+                                pred[idx_part[bs:be], :] += pred_part[bs:be]
+                                bs = be
+                    finally:
+                        if pred_part is not None:
+                            del pred_part
+                        del input_dict
                         if self.cfg.empty_cache:
                             torch.cuda.empty_cache()
-                        bs = 0
-                        for be in input_dict["offset"]:
-                            pred[idx_part[bs:be], :] += pred_part[bs:be]
-                            bs = be
 
                     logger.info(
-                        "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(
+                        "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}, Points: {npts}".format(
                             idx + 1,
                             len(self.test_loader),
                             data_name=data_name,
-                            batch_idx=i,
+                            batch_idx=e_i,
                             batch_num=len(fragment_list),
+                            npts=n_fragment_points,
                         )
                     )
+                # #原来的代码
+                # pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
+                # for i in range(len(fragment_list)):
+                #     fragment_batch_size = 1
+                #     # fragment_batch_size = getattr(self.cfg, "fragment_batch_size_test", 1)
+                #     s_i, e_i = i * fragment_batch_size, min(
+                #         (i + 1) * fragment_batch_size, len(fragment_list)
+                #     )
+                #     input_dict = collate_fn(fragment_list[s_i:e_i])
+                #     for key in input_dict.keys():
+                #         if isinstance(input_dict[key], torch.Tensor):
+                #             input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                #     idx_part = input_dict["index"]
+                #     with torch.no_grad():
+                #         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                #         pred_part = F.softmax(pred_part, -1)
+                #         if self.cfg.empty_cache:
+                #             torch.cuda.empty_cache()
+                #         bs = 0
+                #         for be in input_dict["offset"]:
+                #             pred[idx_part[bs:be], :] += pred_part[bs:be]
+                #             bs = be
+
+                #     logger.info(
+                #         "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(
+                #             idx + 1,
+                #             len(self.test_loader),
+                #             data_name=data_name,
+                #             batch_idx=i,
+                #             batch_num=len(fragment_list),
+                #         )
+                #     )
                 if self.cfg.data.test.type == "ScanNetPPDataset":
                     pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
                 else:

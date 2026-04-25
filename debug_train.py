@@ -61,7 +61,7 @@ for batch in dataloader:
     
     # Try forward pass with debugging
     try:
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
             output_dict = model(input_dict)
             loss = output_dict['loss']
         print('Forward pass succeeded')
