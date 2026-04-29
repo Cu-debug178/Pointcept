@@ -23,15 +23,37 @@ class DefaultSegmentor(nn.Module):
             # PPT (https://arxiv.org/abs/2308.09718)
             # currently, only support one batch one condition
             input_dict["condition"] = input_dict["condition"][0]
+
         seg_logits = self.backbone(input_dict)
+
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
-            return dict(loss=loss)
+
+            # ===== Added: return seg_logits during training for train metrics =====
+            # 功能说明：
+            # 原始代码训练阶段只返回 loss：
+            #     return dict(loss=loss)
+            #
+            # 这样 InformationWriter 只能记录 train/loss，
+            # Trainer 也拿不到预测结果，无法计算 train mIoU / mAcc / allAcc。
+            #
+            # 这里额外返回 seg_logits.detach()，用于训练阶段计算指标：
+            #     train_batch/mIoU
+            #     train_batch/mAcc
+            #     train_batch/allAcc
+            #
+            # 为什么要 detach：
+            # 1. 指标计算不需要反向传播；
+            # 2. 避免日志或 metric 计算保留计算图；
+            # 3. 降低显存占用风险。
+            return dict(loss=loss, seg_logits=seg_logits.detach())
+
         # eval
         elif "segment" in input_dict.keys():
             loss = self.criteria(seg_logits, input_dict["segment"])
             return dict(loss=loss, seg_logits=seg_logits)
+
         # test
         else:
             return dict(seg_logits=seg_logits)
@@ -56,6 +78,7 @@ class DefaultSegmentorV2(nn.Module):
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
         self.freeze_backbone = freeze_backbone
+
         if self.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
@@ -63,6 +86,7 @@ class DefaultSegmentorV2(nn.Module):
     def forward(self, input_dict, return_point=False):
         point = Point(input_dict)
         point = self.backbone(point)
+
         # Backbone added after v1.5.0 return Point instead of feat and use DefaultSegmentorV2
         # TODO: remove this part after make all backbone return Point only.
         if isinstance(point, Point):
@@ -75,23 +99,39 @@ class DefaultSegmentorV2(nn.Module):
             feat = point.feat
         else:
             feat = point
+
         seg_logits = self.seg_head(feat)
         return_dict = dict()
+
         if return_point:
             # PCA evaluator parse feat and coord in point
             return_dict["point"] = point
+
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
             return_dict["loss"] = loss
+
+            # ===== Added: return detached seg_logits during training =====
+            # 功能说明：
+            # 用于 Trainer 在训练阶段计算语义分割指标。
+            # 如果不返回 seg_logits，训练日志只能看到 loss，看不到 train mIoU / mAcc / allAcc。
+            #
+            # 注意：
+            # 这里必须使用 detach()，因为指标计算只需要预测类别，
+            # 不需要把 TensorBoard 日志相关内容加入计算图。
+            return_dict["seg_logits"] = seg_logits.detach()
+
         # eval
         elif "segment" in input_dict.keys():
             loss = self.criteria(seg_logits, input_dict["segment"])
             return_dict["loss"] = loss
             return_dict["seg_logits"] = seg_logits
+
         # test
         else:
             return_dict["seg_logits"] = seg_logits
+
         return return_dict
 
 
@@ -121,6 +161,7 @@ class DefaultLORASegmentorV2(nn.Module):
         self.keywords = keywords
         self.replacements = replacements
         self.backbone = build_model(backbone)
+
         backbone_weight = torch.load(
             backbone_path,
             map_location=lambda storage, loc: storage.cuda(),
@@ -145,30 +186,39 @@ class DefaultLORASegmentorV2(nn.Module):
         if self.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+
         if self.use_lora:
             for name, param in self.backbone.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
+
         self.backbone.enc.print_trainable_parameters()
 
     def backbone_load(self, checkpoint):
         weight = OrderedDict()
+
         for key, value in checkpoint["state_dict"].items():
             if not key.startswith("module."):
                 key = "module." + key  # xxx.xxx -> module.xxx.xxx
+
             # Now all keys contain "module." no matter DDP or not.
             if self.keywords in key:
                 key = key.replace(self.keywords, self.replacements)
+
             key = key[7:]  # module.xxx.xxx -> xxx.xxx
+
             if key.startswith("backbone."):
                 key = key[9:]
+
             weight[key] = value
+
         load_state_info = self.backbone.load_state_dict(weight, strict=False)
         print(f"Missing keys: {load_state_info[0]}")
         print(f"Unexpected keys: {load_state_info[1]}")
 
     def forward(self, input_dict, return_point=False):
         point = Point(input_dict)
+
         if self.freeze_backbone and not self.use_lora:
             with torch.no_grad():
                 point = self.backbone(point)
@@ -188,18 +238,34 @@ class DefaultLORASegmentorV2(nn.Module):
 
         seg_logits = self.seg_head(feat)
         return_dict = dict()
+
         if return_point:
             return_dict["point"] = point
 
+        # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
             return_dict["loss"] = loss
+
+            # ===== Added: return detached seg_logits during training =====
+            # 功能说明：
+            # LoRA 分割模型训练时同样需要返回预测结果，
+            # 这样 Trainer 才能统一计算 train mIoU / mAcc / allAcc。
+            #
+            # detach 的原因：
+            # 训练指标只用于日志，不参与 loss.backward()。
+            return_dict["seg_logits"] = seg_logits.detach()
+
+        # eval
         elif "segment" in input_dict.keys():
             loss = self.criteria(seg_logits, input_dict["segment"])
             return_dict["loss"] = loss
             return_dict["seg_logits"] = seg_logits
+
+        # test
         else:
             return_dict["seg_logits"] = seg_logits
+
         return return_dict
 
 
@@ -222,40 +288,50 @@ class DINOEnhancedSegmentor(nn.Module):
         self.backbone = build_model(backbone) if backbone is not None else None
         self.criteria = build_criteria(criteria)
         self.freeze_backbone = freeze_backbone
+
         if self.backbone is not None and self.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
     def forward(self, input_dict, return_point=False):
         point = Point(input_dict)
+
         if self.backbone is not None:
             if self.freeze_backbone:
                 with torch.no_grad():
                     point = self.backbone(point)
             else:
                 point = self.backbone(point)
+
             point_list = [point]
+
             while "unpooling_parent" in point_list[-1].keys():
                 point_list.append(point_list[-1].pop("unpooling_parent"))
+
             for i in reversed(range(1, len(point_list))):
                 point = point_list[i]
                 parent = point_list[i - 1]
                 assert "pooling_inverse" in point.keys()
                 inverse = point.pooling_inverse
                 parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+
             point = point_list[0]
+
             while "pooling_parent" in point.keys():
                 assert "pooling_inverse" in point.keys()
                 parent = point.pop("pooling_parent")
                 inverse = point.pooling_inverse
                 parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
                 point = parent
+
             feat = [point.feat]
         else:
             feat = []
+
         dino_coord = input_dict["dino_coord"]
         dino_feat = input_dict["dino_feat"]
         dino_offset = input_dict["dino_offset"]
+
         idx = torch_cluster.knn(
             x=dino_coord,
             y=point.origin_coord,
@@ -267,22 +343,37 @@ class DINOEnhancedSegmentor(nn.Module):
         feat.append(dino_feat[idx])
         feat = torch.concatenate(feat, dim=-1)
         seg_logits = self.seg_head(feat)
+
         return_dict = dict()
+
         if return_point:
             # PCA evaluator parse feat and coord in point
             return_dict["point"] = point
+
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
             return_dict["loss"] = loss
+
+            # ===== Added: return detached seg_logits during training =====
+            # 功能说明：
+            # DINOEnhancedSegmentor 如果参与语义分割训练，
+            # 也需要把训练阶段预测结果返回给 Trainer 计算训练指标。
+            #
+            # 注意：
+            # seg_logits.detach() 只用于 metric，不影响正常反向传播。
+            return_dict["seg_logits"] = seg_logits.detach()
+
         # eval
         elif "segment" in input_dict.keys():
             loss = self.criteria(seg_logits, input_dict["segment"])
             return_dict["loss"] = loss
             return_dict["seg_logits"] = seg_logits
+
         # test
         else:
             return_dict["seg_logits"] = seg_logits
+
         return return_dict
 
 
@@ -315,6 +406,7 @@ class DefaultClassifier(nn.Module):
     def forward(self, input_dict):
         point = Point(input_dict)
         point = self.backbone(point)
+
         # Backbone added after v1.5.0 return Point instead of feat
         # And after v1.5.0 feature aggregation for classification operated in classifier
         # TODO: remove this part after make all backbone return Point only.
@@ -327,12 +419,16 @@ class DefaultClassifier(nn.Module):
             feat = point.feat
         else:
             feat = point
+
         cls_logits = self.cls_head(feat)
+
         if self.training:
             loss = self.criteria(cls_logits, input_dict["category"])
             return dict(loss=loss)
+
         elif "category" in input_dict.keys():
             loss = self.criteria(cls_logits, input_dict["category"])
             return dict(loss=loss, cls_logits=cls_logits)
+
         else:
             return dict(cls_logits=cls_logits)

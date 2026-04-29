@@ -9,13 +9,11 @@ class GeometryDifficultyRouter(nn.Module):
     Goals:
         1. Reuse existing KPConvX neighborhood topology.
         2. Predict a difficulty score per point.
-        3. Bias DA small/large branch selection.
-        4. Control how much SGCA residual is injected.
+        3. Control how much SGCA residual is injected.
 
     Outputs:
-        difficulty   : [N, 1] in [0, 1]
-        local_logits : [N, 2] router bias for DA gate
-        global_weight: [N, 1] router weight for SGCA residual
+        difficulty    : [N, 1] in [0, 1]
+        global_weight : [N, 1] router weight for SGCA residual
     """
 
     def __init__(
@@ -24,7 +22,6 @@ class GeometryDifficultyRouter(nn.Module):
         hidden_dim=None,
         dropout=0.0,
         temperature=1.0,
-        local_boost=1.0,
         global_boost=1.0,
     ):
         super().__init__()
@@ -32,7 +29,6 @@ class GeometryDifficultyRouter(nn.Module):
 
         self.dim = dim
         self.temperature = max(float(temperature), 1e-6)
-        self.local_boost = float(local_boost)
         self.global_boost = float(global_boost)
 
         self.norm = nn.LayerNorm(dim)
@@ -46,6 +42,7 @@ class GeometryDifficultyRouter(nn.Module):
         )
 
         self.difficulty_head = nn.Linear(hidden_dim, 1)
+
         self.global_head = nn.Sequential(
             nn.Linear(hidden_dim + 1, hidden_dim),
             nn.GELU(),
@@ -85,31 +82,36 @@ class GeometryDifficultyRouter(nn.Module):
     def forward(self, feats, points, neighbors):
         if feats.numel() == 0:
             empty_1 = feats.new_zeros((0, 1))
-            empty_2 = feats.new_zeros((0, 2))
             return {
                 "difficulty": empty_1,
-                "local_logits": empty_2,
                 "global_weight": empty_1,
             }
 
-        x, mean_dist, dist_var, feat_var = self._collect_stats(feats, points, neighbors)
-        router_input = torch.cat([x, mean_dist, dist_var, feat_var], dim=-1)
+        x, mean_dist, dist_var, feat_var = self._collect_stats(
+            feats,
+            points,
+            neighbors,
+        )
+
+        router_input = torch.cat(
+            [x, mean_dist, dist_var, feat_var],
+            dim=-1,
+        )
+
         hidden = self.router_mlp(router_input)
 
         difficulty_logit = self.difficulty_head(hidden) / self.temperature
         difficulty = torch.sigmoid(difficulty_logit)
 
-        # first logit -> small / fine branch
-        # second logit -> large / coarse branch
-        local_logits = self.local_boost * torch.cat(
-            [difficulty_logit, -difficulty_logit], dim=-1
+        global_logit = self.global_head(
+            torch.cat([hidden, difficulty], dim=-1)
         )
 
-        global_logit = self.global_head(torch.cat([hidden, difficulty], dim=-1))
-        global_weight = torch.sigmoid(global_logit + self.global_boost * difficulty_logit)
+        global_weight = torch.sigmoid(
+            global_logit + self.global_boost * difficulty_logit
+        )
 
         return {
             "difficulty": difficulty,
-            "local_logits": local_logits,
             "global_weight": global_weight,
         }

@@ -14,21 +14,41 @@ class KPConvXHybrid(KPConvXStage2):
     """
     Final hybrid backbone used in this project.
 
-    Effective pipeline:
-        KPConvX base backbone
-        -> geometry difficulty router
-        -> Stage-2 dynamic local adapter (DA)
-        -> SGCA-lite global context
-        -> difficulty-aware global fusion
-        -> decoder
-        -> lightweight decoder refine
-        -> segmentation head
+    Effective pipeline
+    ------------------
+    KPConvX base backbone
+    -> Density-Adaptive KPConvX kernel scaling
+    -> geometry difficulty router
+    -> SGCA global context
+    -> difficulty-aware global fusion
+    -> decoder
+    -> lightweight decoder refine
+    -> segmentation head
 
-    Notes:
-        - keep KPConvXBase as the true backbone主体
-        - do not rebuild dynamic graph
-        - router changes actual model behavior
-        - preserve Pointcept DefaultSegmentor compatibility
+    DA-KPConvX
+    ----------
+    For selected encoder stages, compute density-adaptive scale s_i:
+
+        rho_i = 1 / (mean_neighbor_distance_i + eps)
+
+        dense region:
+            rho_i high -> s_i small
+
+        sparse region:
+            rho_i low -> s_i large
+
+    Then pass s_i into DAKPConvX:
+
+        p_k_da = s_i * p_k
+
+    Notes
+    -----
+    - Original KPConvX baseline files are not modified.
+    - DA is applied inside DAKPNextMultiShortcutBlock / DAKPConvX.
+    - Router no longer controls Fine / Coarse local branches.
+    - Router only controls global SGCA fusion.
+    - No dynamic graph rebuild.
+    - Preserve Pointcept DefaultSegmentor compatibility.
     """
 
     def __init__(
@@ -45,7 +65,6 @@ class KPConvXHybrid(KPConvXStage2):
         router_hidden_ratio=0.5,
         router_dropout=0.0,
         router_temperature=1.0,
-        router_local_boost=1.0,
         router_global_boost=1.0,
         enable_global=True,
         global_stages=(4, 5),
@@ -55,9 +74,8 @@ class KPConvXHybrid(KPConvXStage2):
         global_dropout=0.0,
         enable_da=True,
         da_stages=(2, 3, 4),
-        da_dropout=0.0,
-        da_scale_range=(0.75, 1.35),
-        da_branch_scales=(0.85, 1.25),
+        da_scale_range=(0.5, 2.0),
+        da_density_k=16,
         enable_refine=True,
         refine_hidden_ratio=0.5,
         refine_dropout=0.0,
@@ -69,6 +87,7 @@ class KPConvXHybrid(KPConvXStage2):
     ):
         if input_channels is None:
             input_channels = in_channels
+
         if input_channels is None:
             raise ValueError("Either `in_channels` or `input_channels` must be provided.")
 
@@ -77,14 +96,28 @@ class KPConvXHybrid(KPConvXStage2):
         self.fusion_cfg = fusion_cfg or {}
         self.refine_cfg = refine_cfg or {}
 
+        # Router config
         enable_router = self.router_cfg.get("enable", enable_router)
         router_stages = self.router_cfg.get("stages", router_stages)
         router_hidden_ratio = self.router_cfg.get("hidden_ratio", router_hidden_ratio)
         router_dropout = self.router_cfg.get("dropout", router_dropout)
         router_temperature = self.router_cfg.get("temperature", router_temperature)
-        router_local_boost = self.router_cfg.get("local_boost", router_local_boost)
         router_global_boost = self.router_cfg.get("global_boost", router_global_boost)
 
+        # Global config
+        enable_global = self.global_cfg.get("enable", enable_global)
+        global_stages = self.global_cfg.get("stages", global_stages)
+        global_patch_sizes = self.global_cfg.get("patch_sizes", global_patch_sizes)
+        global_num_heads = self.global_cfg.get("num_heads", global_num_heads)
+        global_mlp_ratio = self.global_cfg.get("mlp_ratio", global_mlp_ratio)
+        global_dropout = self.global_cfg.get("dropout", global_dropout)
+
+        # Fusion config
+        # Currently reserved. Router global_weight is used directly.
+        router_global_boost = self.fusion_cfg.get("global_boost", router_global_boost)
+
+        # Refine config
+        enable_refine = self.refine_cfg.get("enable", enable_refine)
         refine_hidden_ratio = self.refine_cfg.get("hidden_ratio", refine_hidden_ratio)
         refine_dropout = self.refine_cfg.get("dropout", refine_dropout)
         refine_use_coords = self.refine_cfg.get("use_coords", refine_use_coords)
@@ -107,9 +140,8 @@ class KPConvXHybrid(KPConvXStage2):
             global_dropout=global_dropout,
             enable_da=enable_da,
             da_stages=da_stages,
-            da_dropout=da_dropout,
             da_scale_range=da_scale_range,
-            da_branch_scales=da_branch_scales,
+            da_density_k=da_density_k,
             init_channels=init_channels,
             channel_scaling=channel_scaling,
             **kwargs,
@@ -125,13 +157,16 @@ class KPConvXHybrid(KPConvXStage2):
             for stage in self.router_stages:
                 if stage < 1 or stage > self.num_layers:
                     raise ValueError(f"Invalid router stage index: {stage}")
+
                 # When grid_pool is enabled, the last block of each stage outputs
                 # the next layer's channels. So router should use the next layer's dim.
                 if self.grid_pool and stage < self.num_layers:
                     dim = layer_channels[stage]
                 else:
                     dim = layer_channels[stage - 1]
+
                 hidden_dim = max(32, int(dim * float(router_hidden_ratio)))
+
                 setattr(
                     self,
                     f"router_{stage}",
@@ -140,15 +175,16 @@ class KPConvXHybrid(KPConvXStage2):
                         hidden_dim=hidden_dim,
                         dropout=router_dropout,
                         temperature=router_temperature,
-                        local_boost=router_local_boost,
                         global_boost=router_global_boost,
                     ),
                 )
 
         self.enable_refine = bool(enable_refine) and self.task == "cloud_segmentation"
+
         if self.enable_refine:
             refine_dim = layer_channels[0]
             refine_hidden_dim = max(32, int(refine_dim * float(refine_hidden_ratio)))
+
             self.decoder_refine = DecoderRefineHead(
                 dim=refine_dim,
                 hidden_dim=refine_hidden_dim,
@@ -160,19 +196,12 @@ class KPConvXHybrid(KPConvXStage2):
     def _route_stage_if_needed(self, stage_idx, feats, points, neighbors):
         if not self.enable_router:
             return None
+
         if stage_idx not in self.router_stages:
             return None
+
         router = getattr(self, f"router_{stage_idx}")
         return router(feats, points, neighbors)
-
-    def _apply_da_if_needed(self, stage_idx, feats, points, neighbors, router_state=None):
-        if not self.enable_da:
-            return feats
-        if stage_idx not in self.da_stages:
-            return feats
-        da_block = getattr(self, f"da_{stage_idx}")
-        route_logits = None if router_state is None else router_state.get("local_logits")
-        return da_block(feats, points, neighbors, route_logits=route_logits)
 
     def _apply_global_with_router(self, stage_idx, feats, points, lengths, router_state=None):
         out = self._apply_sgca_if_needed(
@@ -181,17 +210,21 @@ class KPConvXHybrid(KPConvXStage2):
             points=points,
             lengths=lengths,
         )
+
         if router_state is None:
             return out
 
         global_weight = router_state.get("global_weight")
+
         if global_weight is None:
             return out
+
         return feats + global_weight * (out - feats)
 
     def _apply_refine_if_needed(self, feats, points, neighbors):
         if not self.enable_refine:
             return feats
+
         return self.decoder_refine(feats, points, neighbors)
 
     def forward(self, data_dict):
@@ -229,6 +262,7 @@ class KPConvXHybrid(KPConvXStage2):
 
         # ------ Encoder ------
         skip_feats = []
+
         for layer in range(1, self.num_layers + 1):
             l = layer - 1
             block_list = getattr(self, f"encoder_{layer}")
@@ -241,7 +275,15 @@ class KPConvXHybrid(KPConvXStage2):
                         feats,
                         in_dict.neighbors[l],
                     )
+
             else:
+                da_scale = self._get_da_scale_if_needed(
+                    stage_idx=layer,
+                    points=in_dict.points[l],
+                    neighbors=in_dict.neighbors[l],
+                    lengths=in_dict.lengths[l],
+                )
+
                 upcut = None
                 for block in block_list:
                     feats, upcut = block(
@@ -251,6 +293,7 @@ class KPConvXHybrid(KPConvXStage2):
                         in_dict.neighbors[l],
                         in_dict.lengths[l],
                         upcut=upcut,
+                        da_scale=da_scale,
                     )
 
             router_state = self._route_stage_if_needed(
@@ -258,14 +301,6 @@ class KPConvXHybrid(KPConvXStage2):
                 feats=feats,
                 points=in_dict.points[l],
                 neighbors=in_dict.neighbors[l],
-            )
-
-            feats = self._apply_da_if_needed(
-                stage_idx=layer,
-                feats=feats,
-                points=in_dict.points[l],
-                neighbors=in_dict.neighbors[l],
-                router_state=router_state,
             )
 
             feats = self._apply_global_with_router(
@@ -280,6 +315,7 @@ class KPConvXHybrid(KPConvXStage2):
                 skip_feats.append(feats)
 
                 layer_pool = getattr(self, f"pooling_{layer}")
+
                 if self.grid_pool:
                     if isinstance(in_dict.pools[l], tuple):
                         feats = layer_pool(
@@ -289,6 +325,7 @@ class KPConvXHybrid(KPConvXStage2):
                         )
                     else:
                         feats = layer_pool(feats, in_dict.pools[l])
+
                 else:
                     feats = layer_pool(
                         in_dict.points[l + 1],
@@ -322,6 +359,7 @@ class KPConvXHybrid(KPConvXStage2):
 
                 if self.add_decoder_layer:
                     block = getattr(self, f"decoder_layer_{layer}")
+
                     if self.kp_mode in ["kpconv", "kpconvtest"]:
                         feats = block(
                             in_dict.points[l],
@@ -329,7 +367,9 @@ class KPConvXHybrid(KPConvXStage2):
                             feats,
                             in_dict.neighbors[l],
                         )
+
                     else:
+                        # Decoder remains unchanged for stability.
                         feats, _ = block(
                             in_dict.points[l],
                             in_dict.points[l],

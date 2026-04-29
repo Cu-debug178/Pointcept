@@ -2,87 +2,32 @@ import torch
 import torch.nn as nn
 
 
-class DAKPXBlockAdapter(nn.Module):
+class DensityAdaptiveScale(nn.Module):
     """
-    Stage-2 dynamic local adapter for KPConvX.
+    Density-to-scale mapper for DA-KPConvX.
 
-    Design principles:
-        1. Do not rebuild graph / neighbor topology.
-        2. Use existing pyramid neighbors from KPConvX.
-        3. Estimate local density from current neighbors.
-        4. Use two dynamic receptive-field branches:
-            - small / fine branch
-            - large / coarse branch
-        5. Fuse them with a learned gate.
-        6. Optionally accept router logits to bias branch selection.
+    rho_i = 1 / (mean KNN distance + eps)
 
-    Input:
-        feats        : [N, C]
-        points       : [N, 3]
-        neighbors    : [N, K]
-        route_logits : [N, 2] or None
+    Normalized linear mapping:
 
-    Output:
-        feats        : [N, C]
+        s_i = s_min + (s_max - s_min) * (1 - norm(rho_i))
+
+    Dense area:
+        rho high -> s_i close to s_min
+
+    Sparse area:
+        rho low -> s_i close to s_max
     """
 
-    def __init__(
-        self,
-        dim,
-        hidden_dim=None,
-        dropout=0.0,
-        scale_range=(0.75, 1.35),
-        branch_scales=(0.85, 1.25),
-    ):
+    def __init__(self, scale_range=(0.5, 2.0), density_k=16, eps=1e-6):
         super().__init__()
-        hidden_dim = hidden_dim or dim
+        self.s_min = float(scale_range[0])
+        self.s_max = float(scale_range[1])
+        self.density_k = int(density_k) if density_k is not None else None
+        self.eps = float(eps)
 
-        self.dim = dim
-        self.scale_min = float(scale_range[0])
-        self.scale_max = float(scale_range[1])
-        self.small_scale = float(branch_scales[0])
-        self.large_scale = float(branch_scales[1])
-
-        self.norm = nn.LayerNorm(dim)
-
-        self.scale_mlp = nn.Sequential(
-            nn.Linear(dim + 1, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(dim + 1, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),
-        )
-
-        self.center_proj = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        self.small_branch = nn.Sequential(
-            nn.Linear(dim * 2 + 1, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-        )
-
-        self.large_branch = nn.Sequential(
-            nn.Linear(dim * 2 + 1, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-        )
-
-        self.out_proj = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.Dropout(dropout),
-        )
+        if self.s_min <= 0 or self.s_max <= 0 or self.s_min > self.s_max:
+            raise ValueError(f"Invalid scale_range: {scale_range}")
 
     @staticmethod
     def _sanitize_neighbors(neighbors, num_points):
@@ -90,78 +35,68 @@ class DAKPXBlockAdapter(nn.Module):
         safe_neighbors = neighbors.clamp(min=0, max=max(num_points - 1, 0))
         return safe_neighbors, valid.float()
 
-    def _estimate_density(self, points, neighbors):
-        """
-        Density proxy:
-            average distance to existing neighbors.
-        """
+    def _map_density_to_scale(self, rho, lengths=None):
+        scale = torch.empty_like(rho)
+
+        if lengths is None:
+            rho_min = rho.min()
+            rho_max = rho.max()
+            rho_norm = (rho - rho_min) / (rho_max - rho_min + self.eps)
+            scale = self.s_min + (self.s_max - self.s_min) * (1.0 - rho_norm)
+            return scale.clamp(min=self.s_min, max=self.s_max)
+
+        start = 0
+        for length in lengths.tolist():
+            end = start + int(length)
+            if end <= start:
+                start = end
+                continue
+
+            rho_b = rho[start:end]
+            rho_min = rho_b.min()
+            rho_max = rho_b.max()
+            rho_norm = (rho_b - rho_min) / (rho_max - rho_min + self.eps)
+
+            scale[start:end] = self.s_min + (self.s_max - self.s_min) * (1.0 - rho_norm)
+            start = end
+
+        return scale.clamp(min=self.s_min, max=self.s_max)
+
+    @torch.no_grad()
+    def forward(self, points, neighbors, lengths=None):
+        if points.numel() == 0:
+            return points.new_zeros((0, 1))
+
+        if self.density_k is not None and neighbors.shape[1] > self.density_k:
+            neighbors = neighbors[:, : self.density_k]
+
         safe_neighbors, valid = self._sanitize_neighbors(neighbors, points.shape[0])
 
         neigh_points = points[safe_neighbors]
-        center_points = points.unsqueeze(1)
-        dist = torch.norm(neigh_points - center_points, dim=-1)
+        dist = torch.norm(neigh_points - points.unsqueeze(1), dim=-1)
 
-        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
-        density = (dist * valid).sum(dim=1, keepdim=True) / denom
-        return density, dist, safe_neighbors, valid
+        # Remove self-neighbor with zero distance.
+        self_mask = dist <= self.eps
+        valid = valid * (~self_mask).float()
 
-    @staticmethod
-    def _weighted_context(feats, safe_neighbors, dist, valid, effective_scale):
-        """
-        Weighted neighbor aggregation without changing topology.
-        """
-        neigh_feats = feats[safe_neighbors]
-        effective_scale = effective_scale.clamp(min=1e-6)
-        weight = torch.exp(-dist / effective_scale) * valid
-        norm = weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        valid_count = valid.sum(dim=1, keepdim=True)
+        mean_dist = (dist * valid).sum(dim=1, keepdim=True) / valid_count.clamp(min=1.0)
 
-        context = (weight.unsqueeze(-1) * neigh_feats).sum(dim=1) / norm
-        return context
+        # If a point has no valid non-self neighbors, use a safe fallback.
+        no_neighbor = valid_count <= 0
+        if no_neighbor.any():
+            if (~no_neighbor).any():
+                fallback_dist = mean_dist[~no_neighbor].mean()
+            else:
+                fallback_dist = points.new_tensor(1.0)
 
-    def forward(self, feats, points, neighbors, route_logits=None):
-        if feats.numel() == 0:
-            return feats
+            mean_dist = torch.where(
+                no_neighbor,
+                fallback_dist.expand_as(mean_dist),
+                mean_dist,
+            )
 
-        x = self.norm(feats)
+        rho = 1.0 / (mean_dist + self.eps)
 
-        density, dist, safe_neighbors, valid = self._estimate_density(points, neighbors)
-        cond = torch.cat([x, density], dim=-1)
-
-        scale = torch.sigmoid(self.scale_mlp(cond))
-        scale = self.scale_min + (self.scale_max - self.scale_min) * scale
-
-        gate_logits = self.gate_mlp(cond)
-        if route_logits is not None:
-            if route_logits.shape != gate_logits.shape:
-                raise ValueError(
-                    f"route_logits shape {tuple(route_logits.shape)} does not match "
-                    f"gate logits shape {tuple(gate_logits.shape)}"
-                )
-            gate_logits = gate_logits + route_logits
-        gate = torch.softmax(gate_logits, dim=-1)
-
-        center = self.center_proj(x)
-
-        small_context = self._weighted_context(
-            x,
-            safe_neighbors,
-            dist,
-            valid,
-            effective_scale=scale * self.small_scale,
-        )
-
-        large_context = self._weighted_context(
-            x,
-            safe_neighbors,
-            dist,
-            valid,
-            effective_scale=scale * self.large_scale,
-        )
-
-        small_out = self.small_branch(torch.cat([center, small_context, density], dim=-1))
-        large_out = self.large_branch(torch.cat([center, large_context, density], dim=-1))
-
-        fused = gate[:, 0:1] * small_out + gate[:, 1:2] * large_out
-        fused = self.out_proj(fused)
-
-        return feats + fused
+        da_scale = self._map_density_to_scale(rho, lengths=lengths)
+        return da_scale.detach()
